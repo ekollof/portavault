@@ -356,7 +356,7 @@ check_deps() {
     done
     case "$OS" in
         openbsd)
-            for cmd in vnconfig newfs_msdos mount_msdos mount_tmpfs; do
+            for cmd in vnconfig newfs_msdos mount_msdos mount_mfs; do
                 command -v "$cmd" >/dev/null 2>&1 \
                     || die "missing required command: $cmd"
             done
@@ -480,7 +480,8 @@ format_fat() {
     fi
 }
 
-# ---- Tmpfs mount/unmount (OS-aware) --------------------------------------
+# ---- Private RAM-backed work directory (OS-aware) ------------------------
+# OpenBSD ships without tmpfs(4); use mount_mfs(8) (same mechanism as /tmp).
 
 mount_private_tmpfs() {
     dir=$1
@@ -490,8 +491,7 @@ mount_private_tmpfs() {
             if [ -z "$size_bytes" ]; then
                 size_bytes=$(parse_size_bytes "$DEFAULT_SIZE")
             fi
-            mount_tmpfs -s "$size_bytes" -u "$(effective_uid)" -m 700 \
-                tmpfs "$dir"
+            mount_mfs -o nodev,nosuid -s "$size_bytes" swap "$dir"
             ;;
         freebsd)  mount -t tmpfs tmpfs "$dir" ;;
         linux)    mount -t tmpfs tmpfs "$dir" ;;
@@ -1058,14 +1058,15 @@ Config file (~/.config/portavault.conf) keys:
 
 Defaults: size=1G, mountpoint=~/vault, vault from config or \$PORTAVAULT_VAULT.
 
-On 'open', the encrypted file is gpg-decrypted into a private tmpfs (memory),
-and the OS-native loopback mechanism attaches the FAT32 image:
-  OpenBSD: vnconfig + mount_msdos
+On 'open', the encrypted file is gpg-decrypted into a private RAM-backed
+work directory (mfs on OpenBSD, tmpfs on FreeBSD/Linux), and the OS-native
+loopback mechanism attaches the FAT32 image:
+  OpenBSD: mount_mfs + vnconfig + mount_msdos
   FreeBSD: mdconfig + mount_msdosfs
   Linux:   mount -t vfat -o loop
 
 On 'close' (or any signal during 'open'), everything is torn down. The
-plaintext is gone when the tmpfs is unmounted.
+plaintext is gone when the work directory is unmounted.
 
 Examples:
   $PROGNAME create ~/vault.img.gpg -s 1G
