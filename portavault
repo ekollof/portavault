@@ -490,7 +490,8 @@ mount_private_tmpfs() {
             if [ -z "$size_bytes" ]; then
                 size_bytes=$(parse_size_bytes "$DEFAULT_SIZE")
             fi
-            mount_tmpfs -s "$size_bytes" mfs "$dir"
+            mount_tmpfs -s "$size_bytes" -u "$(effective_uid)" -m 700 \
+                tmpfs "$dir"
             ;;
         freebsd)  mount -t tmpfs tmpfs "$dir" ;;
         linux)    mount -t tmpfs tmpfs "$dir" ;;
