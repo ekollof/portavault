@@ -463,14 +463,14 @@ attach_and_mount() {
             if ! alloc_loop_attach "$file"; then
                 return 1
             fi
-            mount -t msdos -u "$(effective_uid)" -g "$(effective_gid)" -m 077 \
+            mount_msdos -u "$(effective_uid)" -g "$(effective_gid)" -m 077 \
                 "/dev/${LOOPDEV}c" "$mnt"
             ;;
         freebsd)
             if ! alloc_loop_attach "$file"; then
                 return 1
             fi
-            mount -t msdosfs -u "$(effective_uid)" -g "$(effective_gid)" -m 077 \
+            mount_msdosfs -u "$(effective_uid)" -g "$(effective_gid)" -m 077 \
                 "/dev/${LOOPDEV}" "$mnt"
             ;;
         linux)
@@ -1015,8 +1015,8 @@ Defaults: size=1G, mountpoint=~/vault, vault from config or \$PORTAVAULT_VAULT.
 
 On 'open', the encrypted file is gpg-decrypted into a private tmpfs (memory),
 and the OS-native loopback mechanism attaches the FAT32 image:
-  OpenBSD: vnconfig + mount -t msdos
-  FreeBSD: mdconfig + mount -t msdosfs
+  OpenBSD: vnconfig + mount_msdos
+  FreeBSD: mdconfig + mount_msdosfs
   Linux:   mount -t vfat -o loop
 
 On 'close' (or any signal during 'open'), everything is torn down. The
