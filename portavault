@@ -230,6 +230,19 @@ parse_size_bytes() {
     esac
 }
 
+# Allocate a sparse image (truncate on Linux/FreeBSD; dd elsewhere e.g. OpenBSD).
+alloc_image() {
+    path=$1
+    size_spec=$2
+    if command -v truncate >/dev/null 2>&1; then
+        truncate -s "$size_spec" "$path"
+        return
+    fi
+    bytes=$(parse_size_bytes "$size_spec")
+    dd if=/dev/zero of="$path" bs=1 count=0 seek="$bytes" 2>/dev/null \
+        || die "create: could not allocate ${size_spec} image (need truncate or dd)"
+}
+
 compute_tmpfs_bytes() {
     enc_file=$1
     enc_bytes=$(wc -c < "$enc_file" | tr -d ' ')
@@ -338,7 +351,7 @@ check_gpg_loopback() {
 }
 
 check_deps() {
-    for cmd in gpg gzip gunzip mktemp file od truncate mount umount; do
+    for cmd in gpg gzip gunzip mktemp file od dd mount umount; do
         command -v "$cmd" >/dev/null 2>&1 || die "missing required command: $cmd"
     done
     case "$OS" in
@@ -688,7 +701,7 @@ cmd_create() {
     plain=$(mktemp "/tmp/${PROGNAME}.img.XXXXXX") \
         || die "create: mktemp failed"
     trap 'rm -f "$plain" "${gz:-}"' EXIT INT TERM
-    truncate -s "$size" "$plain"
+    alloc_image "$plain" "$size"
     format_fat "$plain" "$size_bytes"
 
     if [ "$compress" = "1" ]; then
