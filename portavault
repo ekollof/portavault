@@ -124,20 +124,32 @@ effective_uid() {
 }
 
 effective_gid() {
-    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_GID:-}" ]; then
-        printf '%s' "$SUDO_GID"
+    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_UID:-}" ]; then
+        if [ -n "${SUDO_GID:-}" ]; then
+            printf '%s' "$SUDO_GID"
+        elif [ -n "${SUDO_USER:-}" ]; then
+            id -g "$SUDO_USER" 2>/dev/null || id -g
+        else
+            id -g
+        fi
     else
         id -g
     fi
 }
 
-# When invoked via sudo, root-owned state/config block the real user.
+# When invoked via sudo, root-owned paths block the invoking user and run_gpg.
 chown_if_sudo() {
     path=$1
-    if [ "$(id -u)" = "0" ] \
-            && [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
-        chown "$SUDO_UID:$SUDO_GID" "$path" 2>/dev/null || true
+    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_UID:-}" ]; then
+        chown "$SUDO_UID:$(effective_gid)" "$path" 2>/dev/null \
+            || chown "$SUDO_UID" "$path" 2>/dev/null \
+            || true
     fi
+}
+
+prepare_private_dir() {
+    chmod 700 "$1"
+    chown_if_sudo "$1"
 }
 
 # Run gpg as the invoking user when sudo'd, so GNUPGHOME ownership matches.
@@ -153,6 +165,10 @@ run_gpg() {
 prepare_gpg_input() {
     if [ -e "$1" ]; then
         chown_if_sudo "$1"
+    fi
+    dir=$(dirname "$1")
+    if [ -d "$dir" ]; then
+        chown_if_sudo "$dir"
     fi
 }
 
@@ -447,13 +463,15 @@ attach_and_mount() {
             if ! alloc_loop_attach "$file"; then
                 return 1
             fi
-            mount -t msdos "/dev/${LOOPDEV}c" "$mnt"
+            mount -t msdos -u "$(effective_uid)" -g "$(effective_gid)" -m 077 \
+                "/dev/${LOOPDEV}c" "$mnt"
             ;;
         freebsd)
             if ! alloc_loop_attach "$file"; then
                 return 1
             fi
-            mount -t msdosfs "/dev/${LOOPDEV}" "$mnt"
+            mount -t msdosfs -u "$(effective_uid)" -g "$(effective_gid)" -m 077 \
+                "/dev/${LOOPDEV}" "$mnt"
             ;;
         linux)
             mount -t vfat -o loop,uid=$(effective_uid),gid=$(effective_gid),umask=077 \
@@ -722,7 +740,7 @@ cmd_open() {
 
     WORK_DIR=$(mktemp -d "$WORKDIR_TEMPLATE") \
         || die "open: mktemp -d failed"
-    chmod 700 "$WORK_DIR"
+    prepare_private_dir "$WORK_DIR"
 
     staging_enc=""
     if is_url "$vault"; then
@@ -753,10 +771,12 @@ cmd_open() {
         die "open: failed to mount private tmpfs"
     fi
     TMPFS_MOUNTED=1
+    prepare_private_dir "$WORK_DIR"
 
     if [ -n "$staging_enc" ]; then
         mv "$staging_enc" "$WORK_DIR/encrypted.gpg"
         enc="$WORK_DIR/encrypted.gpg"
+        chown_if_sudo "$enc"
     fi
 
     info "decrypting..."
@@ -767,6 +787,7 @@ cmd_open() {
                   --decrypt "$enc" > "$decrypted" 2>/dev/null; then
         die "open: gpg decrypt failed (wrong passphrase or corrupt file)"
     fi
+    chown_if_sudo "$decrypted"
 
     ptype=$(detect_payload_type "$decrypted")
     case "$ptype" in
@@ -777,11 +798,13 @@ cmd_open() {
                 die "open: gunzip failed"
             fi
             rm -f "$decrypted"
+            chown_if_sudo "$img"
             ORIG_COMPRESSED=1
             ;;
         fat)
             info "decrypted content is FAT (uncompressed)"
             img="$decrypted"
+            chown_if_sudo "$img"
             ORIG_COMPRESSED=0
             ;;
         *)
@@ -792,7 +815,7 @@ cmd_open() {
     VAULT_IMG="$img"
 
     mkdir -p "$mountpoint"
-    chmod 700 "$mountpoint"
+    prepare_private_dir "$mountpoint"
     info "mounting at $mountpoint ..."
     if ! attach_and_mount "$img" "$mountpoint"; then
         die "open: mount failed"
@@ -845,12 +868,16 @@ cmd_close() {
             gz=$(mktemp "/tmp/${PROGNAME}.img.XXXXXX") \
                 || die "close: mktemp failed"
             gzip -c "$VAULT_IMG" > "$gz"
+            chown_if_sudo "$gz"
             payload="$gz"
         else
             payload="$VAULT_IMG"
         fi
 
         new_temp="${ORIG_VAULT}.new.$$"
+        if [ -n "${WORK_DIR:-}" ] && [ -d "$WORK_DIR" ]; then
+            chown_if_sudo "$WORK_DIR"
+        fi
         prepare_gpg_input "$payload"
         if ! read_passphrase "Passphrase to save" \
                 | run_gpg --batch --yes --symmetric \
@@ -912,11 +939,12 @@ cmd_passwd() {
     tmpfs_bytes=$(compute_tmpfs_bytes "$vault")
 
     work=$(mktemp -d "$WORKDIR_TEMPLATE") || die "passwd: mktemp -d failed"
-    chmod 700 "$work"
+    prepare_private_dir "$work"
     if ! mount_private_tmpfs "$work" "$tmpfs_bytes"; then
         rmdir "$work" 2>/dev/null
         die "passwd: failed to mount private tmpfs"
     fi
+    prepare_private_dir "$work"
 
     info "decrypting with old passphrase..."
     payload="$work/payload"
@@ -927,6 +955,7 @@ cmd_passwd() {
         rmdir "$work" 2>/dev/null
         die "passwd: decrypt failed"
     fi
+    chown_if_sudo "$payload"
 
     info "encrypting with new passphrase..."
     new_temp="${vault}.new.$$"

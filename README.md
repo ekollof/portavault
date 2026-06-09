@@ -133,8 +133,8 @@ Requires passwordless or interactive `sudo` on Linux for mount tests.
 
 | OS | Loop device | FAT mount |
 |----|-------------|-----------|
-| OpenBSD | `vnconfig` (auto `vnd0`–`vnd7`) | `mount -t msdos` |
-| FreeBSD | `mdconfig` (auto unit) | `mount -t msdosfs` |
+| OpenBSD | `vnconfig` (auto `vnd0`–`vnd7`) | `mount -t msdos -u -g -m 077` |
+| FreeBSD | `mdconfig` (auto unit) | `mount -t msdosfs -u -g -m 077` |
 | Linux | `mount -o loop` | `mount -t vfat` |
 
 OpenBSD tmpfs size is derived from the encrypted file size (clamped by `size` and `tmpfs_size` config keys).

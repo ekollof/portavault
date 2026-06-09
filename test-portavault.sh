@@ -217,14 +217,26 @@ setup_sudo() {
 
 cleanup() {
     if [ -d "$TD" ]; then
+        run_pv close 2>/dev/null || true
+        for mnt in "$TD"/mnt-plain "$TD"/mnt-comp "$TD"/mnt "$TD"/mnt2; do
+            umount "$mnt" 2>/dev/null || true
+        done
         if [ "$KEEP" = "1" ] && [ "$TESTS_FAILED" -eq 0 ]; then
             log "kept artifacts at $TD"
         else
-            rm -rf "$TD"
+            rm -rf "$TD" 2>/dev/null || true
         fi
     fi
 }
 trap cleanup EXIT INT TERM
+
+file_owner_uid() {
+    path=$1
+    case "$OS" in
+        linux) stat -c '%u' "$path" 2>/dev/null ;;
+        *)     stat -f '%u' "$path" 2>/dev/null ;;
+    esac
+}
 
 reset_state() {
     run_pv close 2>/dev/null || true
@@ -319,12 +331,8 @@ test_write_and_ownership() {
         fail "could not write testfile.txt"
         return
     fi
-    if [ "$OS" = "linux" ]; then
-        uid=$(stat -c '%u' "$TD/mnt-plain/testfile.txt" 2>/dev/null)
-        assert_eq "mount file owned by invoking user" "$(id -u)" "$uid"
-    else
-        skip "mount ownership (not linux)"
-    fi
+    uid=$(file_owner_uid "$TD/mnt-plain/testfile.txt")
+    assert_eq "mount file owned by invoking user" "$(id -u)" "$uid"
 }
 
 test_status_active() {
@@ -346,12 +354,8 @@ test_state_permissions() {
         rw-------) pass "state mode 600" ;;
         *) fail "state mode not 600 ($mode)" ;;
     esac
-    if [ "$OS" = "linux" ]; then
-        uid=$(ls -ln "$PORTAVAULT_STATE" | awk '{print $3}')
-        assert_eq "state owned by invoking user" "$(id -u)" "$uid"
-    else
-        skip "state ownership (not linux)"
-    fi
+    uid=$(ls -ln "$PORTAVAULT_STATE" | awk '{print $3}')
+    assert_eq "state owned by invoking user" "$(id -u)" "$uid"
 }
 
 test_double_open_fails() {
