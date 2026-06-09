@@ -1,0 +1,27 @@
+# Encrypted vaults and working images
+*.gpg
+*.img
+*.img.gz
+
+# Runtime state
+*.state
+portavault.state
+
+# Local config (use portavault.conf.example as template)
+portavault.conf
+
+# Test artifacts
+/portavault-test.*/
+tmp.portavault-*
+
+# Editor / OS
+*~
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
+*.bak
+
+# GPG test stubs
+*.asc

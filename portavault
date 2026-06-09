@@ -1,0 +1,984 @@
+#!/bin/sh
+#
+# Copyright (c) 2026 ekollof
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# portavault - portable encrypted vault for OpenBSD, FreeBSD, and Linux
+#
+# Creates a FAT32 image file, gzips it, encrypts with gpg, and on demand
+# decrypts to a private tmpfs, mounts via the OS-native loopback mechanism,
+# and tears it all down on close.
+#
+# POSIX sh only. No bashisms. Tested to run on OpenBSD /bin/sh, FreeBSD
+# /bin/sh, and dash/bash-as-sh on Linux.
+#
+# Subcommands:
+#   create <vault> [-s size] [--no-compress]
+#   open   [vault] [-m mountpoint]
+#   close
+#   status
+#   passwd [vault]
+#   help
+#
+
+set -eu
+
+PROGNAME=portavault
+VERSION=0.2.0
+
+# Tunables (overridable via env or config file)
+PORTAVAULT_STATE="${PORTAVAULT_STATE:-}"
+PORTAVAULT_CONFIG="${PORTAVAULT_CONFIG:-}"
+WORKDIR_TEMPLATE="/tmp/${PROGNAME}.XXXXXXXX"
+GPG_CIPHER_OPTS="--cipher-algo AES256 --s2k-mode 3 --s2k-count 65011712"
+GPG_DIGEST_OPTS="--s2k-digest-algo SHA512"
+DEFAULT_SIZE=1G
+TMPFS_SIZE_CAP=8G
+DEFAULT_MOUNTPOINT=""
+
+# ---- Output helpers ------------------------------------------------------
+
+die() { printf '%s: %s\n' "$PROGNAME" "$*" >&2; exit 1; }
+warn() { printf '%s: %s\n' "$PROGNAME" "$*" >&2; }
+info() { printf '%s: %s\n' "$PROGNAME" "$*"; }
+
+# ---- Tilde expansion (POSIX sh does not do this inside args) -------------
+
+expand_path() {
+    case "$1" in
+        '~')    printf '%s' "$HOME" ;;
+        '~/'*)  printf '%s/%s' "$HOME" "${1#~/}" ;;
+        *)      printf '%s' "$1" ;;
+    esac
+}
+
+# ---- Absolute local path (URLs unchanged) --------------------------------
+
+abs_local_path() {
+    path="$1"
+    case "$path" in
+        /*|'~'|'~/'*) expand_path "$path" ;;
+        *) printf '%s/%s' "$(pwd)" "$path" ;;
+    esac
+}
+
+# ---- URL detection -------------------------------------------------------
+
+is_url() {
+    case "$1" in
+        http://*|https://*|ftp://*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# ---- OS detection --------------------------------------------------------
+
+detect_os() {
+    case "$(uname -s)" in
+        OpenBSD) OS=openbsd ;;
+        FreeBSD) OS=freebsd ;;
+        Linux)   OS=linux ;;
+        *)       die "unsupported OS: $(uname -s)" ;;
+    esac
+}
+
+# ---- Linux sudo: correct HOME and mount ownership ------------------------
+
+resolve_home() {
+    if [ "$OS" = "linux" ] && [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+        sudo_home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+        if [ -n "$sudo_home" ]; then
+            HOME=$sudo_home
+        fi
+    fi
+    DEFAULT_MOUNTPOINT="${DEFAULT_MOUNTPOINT:-$HOME/vault}"
+}
+
+init_paths() {
+    PORTAVAULT_STATE="${PORTAVAULT_STATE:-$HOME/.config/${PROGNAME}.state}"
+    PORTAVAULT_CONFIG="${PORTAVAULT_CONFIG:-$HOME/.config/${PROGNAME}.conf}"
+}
+
+effective_uid() {
+    if [ "$OS" = "linux" ] && [ "$(id -u)" = "0" ] && [ -n "${SUDO_UID:-}" ]; then
+        printf '%s' "$SUDO_UID"
+    else
+        id -u
+    fi
+}
+
+effective_gid() {
+    if [ "$OS" = "linux" ] && [ "$(id -u)" = "0" ] && [ -n "${SUDO_GID:-}" ]; then
+        printf '%s' "$SUDO_GID"
+    else
+        id -g
+    fi
+}
+
+# When invoked via sudo, root-owned state/config block the real user.
+chown_if_sudo() {
+    path=$1
+    if [ "$OS" = "linux" ] && [ "$(id -u)" = "0" ] \
+            && [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
+        chown "$SUDO_UID:$SUDO_GID" "$path" 2>/dev/null || true
+    fi
+}
+
+# Run gpg as the invoking user when linux+sudo, so GNUPGHOME ownership matches.
+run_gpg() {
+    if [ "$OS" = "linux" ] && [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+        sudo -u "$SUDO_USER" gpg "$@"
+    else
+        gpg "$@"
+    fi
+}
+
+# Root-created temp files must be readable by run_gpg's user.
+prepare_gpg_input() {
+    if [ -e "$1" ]; then
+        chown_if_sudo "$1"
+    fi
+}
+
+# ---- Size parsing (POSIX arithmetic) -----------------------------------
+
+parse_size_suffix() {
+    size_str=$1
+    suffix=$2
+    mult=$3
+    base=$size_str
+    case "$suffix" in
+        G) base=${base%G}; base=${base%g}; base=${base%B}; base=${base%b} ;;
+        M) base=${base%M}; base=${base%m}; base=${base%B}; base=${base%b} ;;
+        K) base=${base%K}; base=${base%k}; base=${base%B}; base=${base%b} ;;
+        T) base=${base%T}; base=${base%t}; base=${base%B}; base=${base%b} ;;
+    esac
+    printf '%s' $(( base * mult ))
+}
+
+parse_size_bytes() {
+    size_str=$1
+    case "$size_str" in
+        *G|*g) parse_size_suffix "$size_str" G 1073741824 ;;
+        *M|*m) parse_size_suffix "$size_str" M 1048576 ;;
+        *K|*k) parse_size_suffix "$size_str" K 1024 ;;
+        *T|*t) parse_size_suffix "$size_str" T 1099511627776 ;;
+        *)     printf '%s' "$size_str" ;;
+    esac
+}
+
+compute_tmpfs_bytes() {
+    enc_file=$1
+    enc_bytes=$(wc -c < "$enc_file" | tr -d ' ')
+    min_bytes=$(parse_size_bytes "$DEFAULT_SIZE")
+    cap_bytes=$(parse_size_bytes "$TMPFS_SIZE_CAP")
+    tmpfs_bytes=$(( enc_bytes * 4 ))
+    if [ "$tmpfs_bytes" -lt "$min_bytes" ]; then
+        tmpfs_bytes=$min_bytes
+    fi
+    if [ "$tmpfs_bytes" -gt "$cap_bytes" ]; then
+        tmpfs_bytes=$cap_bytes
+    fi
+    printf '%s' "$tmpfs_bytes"
+}
+
+# ---- Config loading (key=value, no shell execution) ----------------------
+
+check_config_perms() {
+    file=$1
+    perms=$(ls -l "$file" 2>/dev/null | cut -c2-10) || return 0
+    group_w=$(printf '%s' "$perms" | cut -c5)
+    other_w=$(printf '%s' "$perms" | cut -c8)
+    if [ "$group_w" = "w" ] || [ "$other_w" = "w" ]; then
+        die "config $file must not be group- or world-writable"
+    fi
+    cfg_uid=$(ls -ln "$file" 2>/dev/null | awk '{print $3}')
+    my_uid=$(effective_uid)
+    if [ -n "$cfg_uid" ] && [ "$cfg_uid" != "$my_uid" ]; then
+        warn "config $file is not owned by the current user (uid $my_uid)"
+    fi
+}
+
+apply_config_kv() {
+    key=$1
+    val=$2
+    case "$key" in
+        vault)       VAULT=$val ;;
+        mount_point) MOUNT_POINT=$val ;;
+        size)        DEFAULT_SIZE=$val ;;
+        state_file)  PORTAVAULT_STATE=$val ;;
+        tmpfs_size)  TMPFS_SIZE_CAP=$val ;;
+        '') ;;
+        *) warn "config: ignoring unknown key '$key'" ;;
+    esac
+}
+
+load_config() {
+    if [ ! -f "$PORTAVAULT_CONFIG" ]; then
+        return 0
+    fi
+    check_config_perms "$PORTAVAULT_CONFIG"
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ''|\#*) continue ;;
+        esac
+        case "$line" in
+            *=*) ;;
+            *) die "config: malformed line (expected key=value): $line" ;;
+        esac
+        key=${line%%=*}
+        val=${line#*=}
+        apply_config_kv "$key" "$val"
+    done < "$PORTAVAULT_CONFIG"
+}
+
+# ---- File identity (dev/ino) ---------------------------------------------
+
+file_dev_ino() {
+    path=$1
+    case "$OS" in
+        openbsd|freebsd)
+            stat -f '%d %i' "$path" 2>/dev/null
+            ;;
+        linux)
+            stat -c '%d %i' "$path" 2>/dev/null
+            ;;
+    esac
+}
+
+validate_orig_vault() {
+    if [ "${ORIG_READONLY:-0}" = "1" ]; then
+        return 0
+    fi
+    if [ -L "$ORIG_VAULT" ]; then
+        die "close: vault path is a symlink; refusing to save"
+    fi
+    if [ ! -f "$ORIG_VAULT" ]; then
+        die "close: vault file missing: $ORIG_VAULT"
+    fi
+    if [ -n "${ORIG_DEV:-}" ] && [ -n "${ORIG_INO:-}" ]; then
+        current=$(file_dev_ino "$ORIG_VAULT") || die "close: cannot stat $ORIG_VAULT"
+        set -- $current
+        if [ "$1" != "$ORIG_DEV" ] || [ "$2" != "$ORIG_INO" ]; then
+            die "close: vault file identity changed; refusing to save"
+        fi
+    fi
+}
+
+# ---- Dependency checks ---------------------------------------------------
+
+check_gpg_loopback() {
+    if ! printf 'probe' | run_gpg --batch --yes --pinentry-mode loopback \
+            --passphrase-fd 0 --symmetric -o /dev/null - 2>/dev/null; then
+        die "gpg loopback pinentry unavailable (check gpg-agent/gpg.conf)"
+    fi
+}
+
+check_deps() {
+    for cmd in gpg gzip gunzip mktemp file od truncate mount umount; do
+        command -v "$cmd" >/dev/null 2>&1 || die "missing required command: $cmd"
+    done
+    case "$OS" in
+        openbsd)
+            for cmd in vnconfig newfs_msdos mount_tmpfs; do
+                command -v "$cmd" >/dev/null 2>&1 \
+                    || die "missing required command: $cmd"
+            done
+            ;;
+        freebsd)
+            for cmd in mdconfig newfs_msdos; do
+                command -v "$cmd" >/dev/null 2>&1 \
+                    || die "missing required command: $cmd"
+            done
+            ;;
+        linux)
+            command -v mkfs.fat >/dev/null 2>&1 \
+                || die "missing required command: mkfs.fat"
+            ;;
+    esac
+    check_gpg_loopback
+}
+
+# ---- Privilege check -----------------------------------------------------
+
+require_root() {
+    if [ "$(id -u)" != "0" ]; then
+        die "must be run as root (mount/tmpfs operations need privileges)"
+    fi
+}
+
+# ---- Loop device allocation ----------------------------------------------
+
+alloc_loop_attach() {
+    file=$1
+    LOOPDEV=
+    case "$OS" in
+        openbsd)
+            n=0
+            while [ "$n" -le 7 ]; do
+                if vnconfig "vnd$n" "$file" 2>/dev/null; then
+                    LOOPDEV="vnd$n"
+                    return 0
+                fi
+                n=$((n + 1))
+            done
+            return 1
+            ;;
+        freebsd)
+            LOOPDEV=$(mdconfig -a -t vnode -f "$file") || return 1
+            return 0
+            ;;
+        linux)
+            LOOPDEV=
+            return 0
+            ;;
+    esac
+}
+
+detach_loop() {
+    case "$OS" in
+        openbsd)
+            [ -n "${LOOPDEV:-}" ] \
+                && vnconfig -u "$LOOPDEV" >/dev/null 2>&1
+            ;;
+        freebsd)
+            [ -n "${LOOPDEV:-}" ] \
+                && mdconfig -d -u "${LOOPDEV#md}" >/dev/null 2>&1
+            ;;
+        linux)
+            :
+            ;;
+    esac
+}
+
+# ---- FAT32 creation (OS-aware) -------------------------------------------
+
+format_fat32() {
+    file=$1
+    case "$OS" in
+        openbsd)
+            if ! alloc_loop_attach "$file"; then
+                die "create: no free vnd device"
+            fi
+            newfs_msdos -F 32 -L VAULT "/dev/r${LOOPDEV}c" >/dev/null 2>&1
+            vnconfig -u "$LOOPDEV" >/dev/null 2>&1
+            LOOPDEV=
+            ;;
+        freebsd)
+            if ! alloc_loop_attach "$file"; then
+                die "create: mdconfig failed"
+            fi
+            newfs_msdos -F 32 -L VAULT "/dev/${LOOPDEV}" >/dev/null
+            mdconfig -d -u "${LOOPDEV#md}" >/dev/null
+            LOOPDEV=
+            ;;
+        linux)
+            mkfs.fat -F 32 -n VAULT "$file" >/dev/null
+            ;;
+    esac
+}
+
+# ---- Tmpfs mount/unmount (OS-aware) --------------------------------------
+
+mount_private_tmpfs() {
+    dir=$1
+    size_bytes=${2:-}
+    case "$OS" in
+        openbsd)
+            if [ -z "$size_bytes" ]; then
+                size_bytes=$(parse_size_bytes "$DEFAULT_SIZE")
+            fi
+            mount_tmpfs -s "$size_bytes" mfs "$dir"
+            ;;
+        freebsd)  mount -t tmpfs tmpfs "$dir" ;;
+        linux)    mount -t tmpfs tmpfs "$dir" ;;
+    esac
+}
+
+# ---- Attach loopback + mount FAT32 ---------------------------------------
+
+attach_and_mount() {
+    file=$1
+    mnt=$2
+    case "$OS" in
+        openbsd)
+            if ! alloc_loop_attach "$file"; then
+                return 1
+            fi
+            mount -t msdos "/dev/${LOOPDEV}c" "$mnt"
+            ;;
+        freebsd)
+            if ! alloc_loop_attach "$file"; then
+                return 1
+            fi
+            mount -t msdosfs "/dev/${LOOPDEV}" "$mnt"
+            ;;
+        linux)
+            mount -t vfat -o loop,uid=$(effective_uid),gid=$(effective_gid),umask=077 \
+                "$file" "$mnt"
+            LOOPDEV=
+            ;;
+    esac
+}
+
+# ---- Payload type detection ----------------------------------------------
+
+detect_payload_type() {
+    path=$1
+    magic=$(od -An -tx1 -N2 "$path" 2>/dev/null | tr -d ' \n')
+    case "$magic" in
+        1f8b) printf 'gzip' ; return 0 ;;
+    esac
+    ftype=$(file -b "$path" 2>/dev/null || printf 'unknown')
+    case "$ftype" in
+        *FAT*|*DOS/MBR*|*MS-DOS*|*x86\ boot\ sector*|*boot\ sector*)
+            printf 'fat'
+            ;;
+        *)
+            printf 'unknown'
+            ;;
+    esac
+}
+
+# ---- URL fetch (OS-aware) ------------------------------------------------
+
+fetch_url() {
+    url=$1
+    outfile=$2
+    case "$OS" in
+        openbsd) ftp -o "$outfile" "$url" ;;
+        freebsd) fetch -o "$outfile" "$url" ;;
+        linux)
+            if command -v curl >/dev/null 2>&1; then
+                curl -sSL -o "$outfile" "$url"
+            elif command -v wget >/dev/null 2>&1; then
+                wget -q -O "$outfile" "$url"
+            else
+                die "no URL fetcher available (need curl or wget)"
+            fi
+            ;;
+    esac
+}
+
+# ---- State file (key=value, no shell execution) --------------------------
+
+write_state() {
+    mkdir -p "$(dirname "$PORTAVAULT_STATE")"
+    {
+        printf 'OS=%s\n' "$OS"
+        printf 'LOOPDEV=%s\n' "${LOOPDEV:-}"
+        printf 'MOUNT_POINT=%s\n' "$MOUNT_POINT"
+        printf 'WORK_DIR=%s\n' "$WORK_DIR"
+        printf 'VAULT_IMG=%s\n' "${VAULT_IMG:-}"
+        printf 'MOUNTED=%s\n' "${MOUNTED:-1}"
+        printf 'LOOP_ATTACHED=%s\n' "${LOOP_ATTACHED:-1}"
+        printf 'TMPFS_MOUNTED=%s\n' "${TMPFS_MOUNTED:-1}"
+        printf 'ORIG_VAULT=%s\n' "$ORIG_VAULT"
+        printf 'ORIG_COMPRESSED=%s\n' "${ORIG_COMPRESSED:-0}"
+        printf 'ORIG_READONLY=%s\n' "${ORIG_READONLY:-0}"
+        printf 'ORIG_DEV=%s\n' "${ORIG_DEV:-}"
+        printf 'ORIG_INO=%s\n' "${ORIG_INO:-}"
+    } > "$PORTAVAULT_STATE"
+    chmod 600 "$PORTAVAULT_STATE"
+    chown_if_sudo "$PORTAVAULT_STATE"
+}
+
+read_state() {
+    file=$1
+    [ -f "$file" ] || die "state file missing: $file"
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ''|\#*) continue ;;
+            *=*) ;;
+            *) die "state: malformed line: $line" ;;
+        esac
+        key=${line%%=*}
+        val=${line#*=}
+        case "$key" in
+            OS)              OS=$val ;;
+            LOOPDEV)         LOOPDEV=$val ;;
+            MOUNT_POINT)     MOUNT_POINT=$val ;;
+            WORK_DIR)        WORK_DIR=$val ;;
+            VAULT_IMG)       VAULT_IMG=$val ;;
+            MOUNTED)         MOUNTED=$val ;;
+            LOOP_ATTACHED)   LOOP_ATTACHED=$val ;;
+            TMPFS_MOUNTED)   TMPFS_MOUNTED=$val ;;
+            ORIG_VAULT)      ORIG_VAULT=$val ;;
+            ORIG_COMPRESSED) ORIG_COMPRESSED=$val ;;
+            ORIG_READONLY)   ORIG_READONLY=$val ;;
+            ORIG_DEV)        ORIG_DEV=$val ;;
+            ORIG_INO)        ORIG_INO=$val ;;
+            *) warn "state: ignoring unknown key '$key'" ;;
+        esac
+    done < "$file"
+}
+
+cleanup_state() {
+    if [ -f "$PORTAVAULT_STATE" ] && [ "${_CLEANUP_LOADED:-0}" != "1" ]; then
+        read_state "$PORTAVAULT_STATE"
+        _CLEANUP_LOADED=1
+    fi
+
+    rm -f "$PORTAVAULT_STATE"
+
+    if [ "${MOUNTED:-0}" = "1" ] && [ -n "${MOUNT_POINT:-}" ]; then
+        umount "$MOUNT_POINT" 2>/dev/null || warn "umount $MOUNT_POINT failed"
+    fi
+    if [ "${LOOP_ATTACHED:-0}" = "1" ]; then
+        detach_loop
+    fi
+    if [ "${TMPFS_MOUNTED:-0}" = "1" ] && [ -n "${WORK_DIR:-}" ]; then
+        umount "$WORK_DIR" 2>/dev/null || warn "umount $WORK_DIR failed"
+    fi
+    if [ -n "${WORK_DIR:-}" ] && [ -d "$WORK_DIR" ]; then
+        rmdir "$WORK_DIR" 2>/dev/null || warn "rmdir $WORK_DIR failed"
+    fi
+}
+
+# ---- Passphrase input ----------------------------------------------------
+
+read_passphrase() {
+    prompt=$1
+    if [ -t 0 ]; then
+        stty -echo 2>/dev/null || true
+    fi
+    printf '%s: ' "$prompt" >&2
+    IFS= read -r pw
+    rc=$?
+    if [ -t 0 ]; then
+        stty echo 2>/dev/null || true
+    fi
+    printf '\n' >&2
+    [ "$rc" = "0" ] || die "read failed"
+    printf '%s\n' "$pw"
+    pw=
+}
+
+# ---- Subcommand: create --------------------------------------------------
+
+cmd_create() {
+    size="$DEFAULT_SIZE"
+    compress=1
+    vault=""
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -s) [ $# -ge 2 ] || die "create: -s requires a value"
+                size="$2"; shift 2 ;;
+            --no-compress) compress=0; shift ;;
+            -h|--help) usage; exit 0 ;;
+            -*) die "create: unknown option: $1" ;;
+            *)
+                if [ -z "$vault" ]; then
+                    vault="$1"
+                else
+                    die "create: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    [ -n "$vault" ] || die "create: vault path required"
+    vault=$(expand_path "$vault")
+
+    if [ -e "$vault" ]; then
+        die "create: $vault already exists"
+    fi
+
+    case "$OS" in
+        openbsd|freebsd) require_root ;;
+        linux) ;;
+    esac
+
+    info "creating ${size} FAT32 image..."
+    plain=$(mktemp "/tmp/${PROGNAME}.img.XXXXXX") \
+        || die "create: mktemp failed"
+    trap 'rm -f "$plain" "${gz:-}"' EXIT INT TERM
+    truncate -s "$size" "$plain"
+    format_fat32 "$plain"
+
+    if [ "$compress" = "1" ]; then
+        info "compressing with gzip..."
+        gz=$(mktemp "/tmp/${PROGNAME}.img.XXXXXX") \
+            || die "create: mktemp failed"
+        gzip -c "$plain" > "$gz"
+        rm -f "$plain"
+        payload="$gz"
+    else
+        payload="$plain"
+    fi
+
+    info "encrypting with gpg (AES-256)..."
+    prepare_gpg_input "$payload"
+    if ! read_passphrase "Passphrase" \
+            | run_gpg --batch --yes --symmetric \
+                  --pinentry-mode loopback --passphrase-fd 0 \
+                  $GPG_CIPHER_OPTS $GPG_DIGEST_OPTS \
+                  -o "$vault" "$payload"; then
+        die "create: gpg encrypt failed"
+    fi
+    rm -f "$payload"
+    chmod 600 "$vault"
+    chown_if_sudo "$vault"
+
+    trap - EXIT INT TERM
+    info "vault created: $vault"
+}
+
+# ---- Subcommand: open ----------------------------------------------------
+
+cmd_open() {
+    vault="${PORTAVAULT_VAULT:-${VAULT:-}}"
+    mountpoint="${PORTAVAULT_MOUNTPOINT:-${MOUNT_POINT:-$DEFAULT_MOUNTPOINT}}"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -m) [ $# -ge 2 ] || die "open: -m requires a value"
+                mountpoint="$2"; shift 2 ;;
+            -h|--help) usage; exit 0 ;;
+            -*) die "open: unknown option: $1" ;;
+            *)
+                if [ -z "$vault" ]; then
+                    vault="$1"
+                else
+                    die "open: unexpected argument: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    [ -n "$vault" ] || die "open: vault source required (path or URL)"
+    if ! is_url "$vault"; then
+        vault=$(expand_path "$vault")
+        vault=$(abs_local_path "$vault")
+    fi
+    mountpoint=$(expand_path "$mountpoint")
+    ORIG_VAULT="$vault"
+
+    if is_url "$vault"; then
+        ORIG_READONLY=1
+        warn "URL vault is read-only; changes will not be saved on close"
+    else
+        ORIG_READONLY=0
+        dev_ino=$(file_dev_ino "$vault") || die "open: cannot stat $vault"
+        set -- $dev_ino
+        ORIG_DEV=$1
+        ORIG_INO=$2
+    fi
+
+    if [ -f "$PORTAVAULT_STATE" ]; then
+        die "open: vault already active (run '$PROGNAME close' first)"
+    fi
+
+    require_root
+
+    trap cleanup_state EXIT INT TERM
+
+    WORK_DIR=$(mktemp -d "$WORKDIR_TEMPLATE") \
+        || die "open: mktemp -d failed"
+    chmod 700 "$WORK_DIR"
+
+    staging_enc=""
+    if is_url "$vault"; then
+        if [ "$OS" = "linux" ] \
+                && ! command -v curl >/dev/null 2>&1 \
+                && ! command -v wget >/dev/null 2>&1; then
+            die "open: no URL fetcher available (need curl or wget)"
+        fi
+        info "fetching $vault ..."
+        staging_enc=$(mktemp "/tmp/${PROGNAME}.enc.XXXXXX") \
+            || die "open: mktemp failed"
+        if ! fetch_url "$vault" "$staging_enc"; then
+            rm -f "$staging_enc"
+            die "open: fetch failed"
+        fi
+        enc="$staging_enc"
+    else
+        if [ ! -r "$vault" ]; then
+            die "open: cannot read $vault"
+        fi
+        enc="$vault"
+    fi
+
+    tmpfs_bytes=$(compute_tmpfs_bytes "$enc")
+    if ! mount_private_tmpfs "$WORK_DIR" "$tmpfs_bytes"; then
+        rm -f "$staging_enc"
+        rmdir "$WORK_DIR" 2>/dev/null
+        die "open: failed to mount private tmpfs"
+    fi
+    TMPFS_MOUNTED=1
+
+    if [ -n "$staging_enc" ]; then
+        mv "$staging_enc" "$WORK_DIR/encrypted.gpg"
+        enc="$WORK_DIR/encrypted.gpg"
+    fi
+
+    info "decrypting..."
+    decrypted="$WORK_DIR/decrypted"
+    prepare_gpg_input "$enc"
+    if ! read_passphrase "Passphrase" \
+            | run_gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+                  --decrypt "$enc" > "$decrypted" 2>/dev/null; then
+        die "open: gpg decrypt failed (wrong passphrase or corrupt file)"
+    fi
+
+    ptype=$(detect_payload_type "$decrypted")
+    case "$ptype" in
+        gzip)
+            info "decrypted content is gzip-compressed; decompressing..."
+            img="$WORK_DIR/vault.img"
+            if ! gunzip -c "$decrypted" > "$img"; then
+                die "open: gunzip failed"
+            fi
+            rm -f "$decrypted"
+            ORIG_COMPRESSED=1
+            ;;
+        fat)
+            info "decrypted content is FAT32 (uncompressed)"
+            img="$decrypted"
+            ORIG_COMPRESSED=0
+            ;;
+        *)
+            ftype=$(file -b "$decrypted" 2>/dev/null || printf 'unknown')
+            die "open: unrecognized decrypted content (magic/file: $ftype)"
+            ;;
+    esac
+    VAULT_IMG="$img"
+
+    mkdir -p "$mountpoint"
+    chmod 700 "$mountpoint"
+    info "mounting at $mountpoint ..."
+    if ! attach_and_mount "$img" "$mountpoint"; then
+        die "open: mount failed"
+    fi
+    MOUNTED=1
+    LOOP_ATTACHED=1
+    MOUNT_POINT="$mountpoint"
+
+    write_state
+
+    trap - EXIT INT TERM
+
+    info "vault opened at $mountpoint"
+}
+
+# ---- Subcommand: close ---------------------------------------------------
+
+cmd_close() {
+    if [ ! -f "$PORTAVAULT_STATE" ]; then
+        die "close: no active vault"
+    fi
+
+    read_state "$PORTAVAULT_STATE"
+    _CLEANUP_LOADED=1
+    trap cleanup_state EXIT INT TERM
+
+    if [ "${MOUNTED:-0}" = "1" ] && [ -n "${MOUNT_POINT:-}" ]; then
+        info "syncing and unmounting $MOUNT_POINT ..."
+        sync 2>/dev/null || true
+        if ! umount "$MOUNT_POINT" 2>/dev/null; then
+            warn "umount $MOUNT_POINT failed; data may not be saved"
+            cleanup_state
+            return 1
+        fi
+        MOUNTED=0
+    fi
+
+    if [ "${LOOP_ATTACHED:-0}" = "1" ]; then
+        detach_loop
+        LOOP_ATTACHED=0
+    fi
+
+    if [ "${ORIG_READONLY:-0}" = "1" ]; then
+        warn "read-only URL vault; skipping save"
+    elif [ -n "${VAULT_IMG:-}" ] && [ -n "${ORIG_VAULT:-}" ] \
+            && [ -f "$VAULT_IMG" ]; then
+        validate_orig_vault
+        info "saving changes back to $ORIG_VAULT ..."
+        if [ "${ORIG_COMPRESSED:-0}" = "1" ]; then
+            gz=$(mktemp "/tmp/${PROGNAME}.img.XXXXXX") \
+                || die "close: mktemp failed"
+            gzip -c "$VAULT_IMG" > "$gz"
+            payload="$gz"
+        else
+            payload="$VAULT_IMG"
+        fi
+
+        new_temp="${ORIG_VAULT}.new.$$"
+        prepare_gpg_input "$payload"
+        if ! read_passphrase "Passphrase to save" \
+                | run_gpg --batch --yes --symmetric \
+                      --pinentry-mode loopback --passphrase-fd 0 \
+                      $GPG_CIPHER_OPTS $GPG_DIGEST_OPTS \
+                      -o "$new_temp" "$payload"; then
+            rm -f "$new_temp" "${gz:-}"
+            warn "close: re-encrypt failed; vault left unmounted"
+            cleanup_state
+            return 1
+        fi
+        chmod 600 "$new_temp"
+        chown_if_sudo "$new_temp"
+        rm -f "${gz:-}"
+
+        mv -f "$new_temp" "$ORIG_VAULT"
+        info "vault saved"
+    fi
+
+    cleanup_state
+    trap - EXIT INT TERM
+    info "vault closed"
+}
+
+# ---- Subcommand: status --------------------------------------------------
+
+cmd_status() {
+    if [ ! -f "$PORTAVAULT_STATE" ]; then
+        info "no active vault"
+        return 0
+    fi
+    info "vault is active:"
+    read_state "$PORTAVAULT_STATE"
+    printf '  source:      %s\n' "${ORIG_VAULT:-?}"
+    if [ "${ORIG_READONLY:-0}" = "1" ]; then
+        printf '  mode:        read-only (URL)\n'
+    fi
+    printf '  mount point: %s\n' "${MOUNT_POINT:-?}"
+    printf '  loop device: %s\n' "${LOOPDEV:-auto (linux)}"
+    printf '  work dir:    %s\n' "${WORK_DIR:-?}"
+}
+
+# ---- Subcommand: passwd --------------------------------------------------
+
+cmd_passwd() {
+    vault="${PORTAVAULT_VAULT:-${VAULT:-}}"
+    [ $# -gt 0 ] && vault="$1"
+    [ -n "$vault" ] || die "passwd: vault path required"
+    vault=$(expand_path "$vault")
+    vault=$(abs_local_path "$vault")
+    [ -f "$vault" ] || die "passwd: $vault not found"
+
+    if [ -f "$PORTAVAULT_STATE" ]; then
+        die "passwd: vault is currently open; close first"
+    fi
+
+    require_root
+
+    tmpfs_bytes=$(compute_tmpfs_bytes "$vault")
+
+    work=$(mktemp -d "$WORKDIR_TEMPLATE") || die "passwd: mktemp -d failed"
+    chmod 700 "$work"
+    if ! mount_private_tmpfs "$work" "$tmpfs_bytes"; then
+        rmdir "$work" 2>/dev/null
+        die "passwd: failed to mount private tmpfs"
+    fi
+
+    info "decrypting with old passphrase..."
+    payload="$work/payload"
+    if ! read_passphrase "Old passphrase" \
+            | run_gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+                  --decrypt "$vault" > "$payload" 2>/dev/null; then
+        umount "$work" 2>/dev/null
+        rmdir "$work" 2>/dev/null
+        die "passwd: decrypt failed"
+    fi
+
+    info "encrypting with new passphrase..."
+    new_temp="${vault}.new.$$"
+    prepare_gpg_input "$payload"
+    if ! read_passphrase "New passphrase" \
+            | run_gpg --batch --yes --symmetric \
+                  --pinentry-mode loopback --passphrase-fd 0 \
+                  $GPG_CIPHER_OPTS $GPG_DIGEST_OPTS \
+                  -o "$new_temp" "$payload"; then
+        rm -f "$new_temp"
+        umount "$work" 2>/dev/null
+        rmdir "$work" 2>/dev/null
+        die "passwd: encrypt failed"
+    fi
+    chmod 600 "$new_temp"
+    chown_if_sudo "$new_temp"
+
+    if ! read_passphrase "Confirm new passphrase" \
+            | run_gpg --batch --yes --pinentry-mode loopback --passphrase-fd 0 \
+                  --decrypt "$new_temp" >/dev/null 2>/dev/null; then
+        rm -f "$new_temp"
+        umount "$work" 2>/dev/null
+        rmdir "$work" 2>/dev/null
+        die "passwd: verification of new file failed"
+    fi
+
+    mv -f "$new_temp" "$vault"
+    chown_if_sudo "$vault"
+
+    umount "$work" 2>/dev/null
+    rmdir "$work" 2>/dev/null
+    info "passphrase changed for $vault"
+}
+
+# ---- Usage ---------------------------------------------------------------
+
+usage() {
+    cat <<EOF
+$PROGNAME v$VERSION - portable encrypted vault (OpenBSD/FreeBSD/Linux)
+
+Usage:
+  $PROGNAME create   <vault> [-s size] [--no-compress]
+  $PROGNAME open     [vault] [-m mountpoint]
+  $PROGNAME close
+  $PROGNAME status
+  $PROGNAME passwd   [vault]
+  $PROGNAME help
+
+Vault source can be a local path or URL (http://, https://, ftp://).
+URL vaults are read-only; changes are not saved on close.
+
+Config file (~/.config/portavault.conf) keys:
+  vault, mount_point, size, state_file, tmpfs_size
+
+Defaults: size=1G, mountpoint=~/vault, vault from config or \$PORTAVAULT_VAULT.
+
+On 'open', the encrypted file is gpg-decrypted into a private tmpfs (memory),
+and the OS-native loopback mechanism attaches the FAT32 image:
+  OpenBSD: vnconfig + mount -t msdos
+  FreeBSD: mdconfig + mount -t msdosfs
+  Linux:   mount -t vfat -o loop
+
+On 'close' (or any signal during 'open'), everything is torn down. The
+plaintext is gone when the tmpfs is unmounted.
+
+Examples:
+  $PROGNAME create ~/vault.img.gpg -s 1G
+  $PROGNAME open ~/vault.img.gpg
+  $PROGNAME open https://example.com/vault.img.gpg -m /mnt/secret
+  $PROGNAME status
+  $PROGNAME close
+  $PROGNAME passwd ~/vault.img.gpg
+EOF
+}
+
+# ---- Main dispatch -------------------------------------------------------
+
+main() {
+    detect_os
+    resolve_home
+    init_paths
+    load_config
+    check_deps
+
+    cmd="${1:-help}"
+    shift || true
+
+    case "$cmd" in
+        create) cmd_create "$@" ;;
+        open)   cmd_open "$@" ;;
+        close)  cmd_close ;;
+        status) cmd_status ;;
+        passwd) cmd_passwd "$@" ;;
+        help|--help|-h) usage ;;
+        *)      die "unknown command: $cmd (try '$PROGNAME help')" ;;
+    esac
+}
+
+main "$@"

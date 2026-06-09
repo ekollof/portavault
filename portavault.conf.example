@@ -1,0 +1,22 @@
+# ~/.config/portavault.conf - portavault defaults
+#
+# Parsed as key=value lines (not executed as shell). Comments start with #.
+# Variable expansion is NOT performed on values.
+#
+# Path to your vault. Can be a local file path or a URL (read-only).
+# Examples:
+#   vault=/home/user/vault.img.gpg
+#   vault=https://example.com/vault.img.gpg
+vault=
+
+# Default mount point for `portavault open`
+mount_point=/home/user/vault
+
+# Default size for `portavault create`. Suffixes K, M, G, T are accepted.
+size=1G
+
+# Maximum tmpfs size for decrypted plaintext (OpenBSD). Suffixes K, M, G, T.
+# tmpfs_size=8G
+
+# State file location (overrides default of ~/.config/portavault.state).
+# state_file=/tmp/portavault.state
