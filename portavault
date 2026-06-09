@@ -28,7 +28,7 @@
 set -eu
 
 PROGNAME=portavault
-VERSION=0.2.0
+VERSION=0.2.1
 
 # Tunables (overridable via env or config file)
 PORTAVAULT_STATE="${PORTAVAULT_STATE:-}"
