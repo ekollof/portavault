@@ -463,14 +463,14 @@ attach_and_mount() {
             if ! alloc_loop_attach "$file"; then
                 return 1
             fi
-            mount_msdos -u "$(effective_uid)" -g "$(effective_gid)" -m 077 \
+            mount_msdos -u "$(effective_uid)" -g "$(effective_gid)" -m 700 \
                 "/dev/${LOOPDEV}c" "$mnt"
             ;;
         freebsd)
             if ! alloc_loop_attach "$file"; then
                 return 1
             fi
-            mount_msdosfs -u "$(effective_uid)" -g "$(effective_gid)" -m 077 \
+            mount_msdosfs -u "$(effective_uid)" -g "$(effective_gid)" -m 700 \
                 "/dev/${LOOPDEV}" "$mnt"
             ;;
         linux)
