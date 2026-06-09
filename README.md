@@ -139,6 +139,8 @@ Requires passwordless or interactive `sudo` on Linux for mount tests.
 
 OpenBSD tmpfs size is derived from the encrypted file size (clamped by `size` and `tmpfs_size` config keys).
 
+On **FreeBSD and OpenBSD**, images smaller than 256 MiB are formatted as **FAT16** (BSD `newfs_msdos` cannot fit FAT32 below that). Linux uses FAT32 at any supported size.
+
 ## License
 
 BSD 3-Clause License. See [LICENSE](LICENSE).

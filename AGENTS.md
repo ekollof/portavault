@@ -102,6 +102,8 @@ Edit `GPG_CIPHER_OPTS` / `GPG_DIGEST_OPTS` near the top of `portavault`. Ensure 
 
 - Hardcoded `vnd0` / `md0` — use `alloc_loop_attach()` instead
 - OpenBSD tmpfs `-s 1g` cap — use `compute_tmpfs_bytes()`
+- FAT32 on BSD needs ~256 MiB — `format_fat()` uses FAT16 below that via `MIN_FAT32_BYTES`
+- `effective_uid` / `run_gpg` / `chown_if_sudo` — use `SUDO_UID` on all OS, not Linux-only
 - Config example variable names must match `apply_config_kv()` mapping
 - `set -e` in test scripts breaks on expected failures — test script uses `set -u` only
 - Passing vault path on CLI when config already sets `vault` causes "unexpected argument"

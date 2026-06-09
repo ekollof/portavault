@@ -88,9 +88,21 @@ detect_os() {
 
 # ---- Linux sudo: correct HOME and mount ownership ------------------------
 
+sudo_user_home() {
+    user=$1
+    home=$(getent passwd "$user" 2>/dev/null | cut -d: -f6)
+    if [ -z "$home" ]; then
+        home=$(awk -F: -v u="$user" '$1==u{print $6;exit}' /etc/master.passwd 2>/dev/null)
+    fi
+    if [ -z "$home" ]; then
+        home=$(awk -F: -v u="$user" '$1==u{print $6;exit}' /etc/passwd 2>/dev/null)
+    fi
+    printf '%s' "$home"
+}
+
 resolve_home() {
-    if [ "$OS" = "linux" ] && [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
-        sudo_home=$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)
+    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+        sudo_home=$(sudo_user_home "$SUDO_USER")
         if [ -n "$sudo_home" ]; then
             HOME=$sudo_home
         fi
@@ -104,7 +116,7 @@ init_paths() {
 }
 
 effective_uid() {
-    if [ "$OS" = "linux" ] && [ "$(id -u)" = "0" ] && [ -n "${SUDO_UID:-}" ]; then
+    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_UID:-}" ]; then
         printf '%s' "$SUDO_UID"
     else
         id -u
@@ -112,7 +124,7 @@ effective_uid() {
 }
 
 effective_gid() {
-    if [ "$OS" = "linux" ] && [ "$(id -u)" = "0" ] && [ -n "${SUDO_GID:-}" ]; then
+    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_GID:-}" ]; then
         printf '%s' "$SUDO_GID"
     else
         id -g
@@ -122,15 +134,15 @@ effective_gid() {
 # When invoked via sudo, root-owned state/config block the real user.
 chown_if_sudo() {
     path=$1
-    if [ "$OS" = "linux" ] && [ "$(id -u)" = "0" ] \
+    if [ "$(id -u)" = "0" ] \
             && [ -n "${SUDO_UID:-}" ] && [ -n "${SUDO_GID:-}" ]; then
         chown "$SUDO_UID:$SUDO_GID" "$path" 2>/dev/null || true
     fi
 }
 
-# Run gpg as the invoking user when linux+sudo, so GNUPGHOME ownership matches.
+# Run gpg as the invoking user when sudo'd, so GNUPGHOME ownership matches.
 run_gpg() {
-    if [ "$OS" = "linux" ] && [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
+    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
         sudo -u "$SUDO_USER" gpg "$@"
     else
         gpg "$@"
@@ -355,16 +367,33 @@ detach_loop() {
     esac
 }
 
-# ---- FAT32 creation (OS-aware) -------------------------------------------
+# ---- FAT filesystem creation (OS-aware) ----------------------------------
+# BSD newfs_msdos needs ~256 MiB for FAT32 (65525 clusters). Smaller
+# images use FAT16 so tests and modest vaults work on FreeBSD/OpenBSD.
 
-format_fat32() {
+MIN_FAT32_BYTES=268435456
+
+format_fat() {
     file=$1
+    size_bytes=$2
+    fat_bits=32
+    case "$OS" in
+        openbsd|freebsd)
+            if [ "$size_bytes" -lt "$MIN_FAT32_BYTES" ]; then
+                fat_bits=16
+            fi
+            ;;
+    esac
     case "$OS" in
         openbsd)
             if ! alloc_loop_attach "$file"; then
                 die "create: no free vnd device"
             fi
-            newfs_msdos -F 32 -L VAULT "/dev/r${LOOPDEV}c" >/dev/null 2>&1
+            if ! newfs_msdos -F "$fat_bits" -L VAULT "/dev/r${LOOPDEV}c" >/dev/null 2>&1; then
+                vnconfig -u "$LOOPDEV" >/dev/null 2>&1
+                LOOPDEV=
+                die "create: newfs_msdos failed (try -s 256M or larger for FAT32)"
+            fi
             vnconfig -u "$LOOPDEV" >/dev/null 2>&1
             LOOPDEV=
             ;;
@@ -372,14 +401,23 @@ format_fat32() {
             if ! alloc_loop_attach "$file"; then
                 die "create: mdconfig failed"
             fi
-            newfs_msdos -F 32 -L VAULT "/dev/${LOOPDEV}" >/dev/null
-            mdconfig -d -u "${LOOPDEV#md}" >/dev/null
+            if ! newfs_msdos -F "$fat_bits" -L VAULT "/dev/${LOOPDEV}" >/dev/null 2>&1; then
+                mdconfig -d -u "${LOOPDEV#md}" >/dev/null 2>&1
+                LOOPDEV=
+                die "create: newfs_msdos failed (try -s 256M or larger for FAT32)"
+            fi
+            mdconfig -d -u "${LOOPDEV#md}" >/dev/null 2>&1
             LOOPDEV=
             ;;
         linux)
-            mkfs.fat -F 32 -n VAULT "$file" >/dev/null
+            if ! mkfs.fat -F 32 -n VAULT "$file" >/dev/null 2>&1; then
+                die "create: mkfs.fat failed"
+            fi
             ;;
     esac
+    if [ "$fat_bits" = "16" ]; then
+        info "using FAT16 (BSD images under 256M cannot be FAT32)"
+    fi
 }
 
 # ---- Tmpfs mount/unmount (OS-aware) --------------------------------------
@@ -595,12 +633,14 @@ cmd_create() {
         linux) ;;
     esac
 
-    info "creating ${size} FAT32 image..."
+    size_bytes=$(parse_size_bytes "$size")
+
+    info "creating ${size} FAT image..."
     plain=$(mktemp "/tmp/${PROGNAME}.img.XXXXXX") \
         || die "create: mktemp failed"
     trap 'rm -f "$plain" "${gz:-}"' EXIT INT TERM
     truncate -s "$size" "$plain"
-    format_fat32 "$plain"
+    format_fat "$plain" "$size_bytes"
 
     if [ "$compress" = "1" ]; then
         info "compressing with gzip..."
@@ -740,7 +780,7 @@ cmd_open() {
             ORIG_COMPRESSED=1
             ;;
         fat)
-            info "decrypted content is FAT32 (uncompressed)"
+            info "decrypted content is FAT (uncompressed)"
             img="$decrypted"
             ORIG_COMPRESSED=0
             ;;
