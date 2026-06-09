@@ -11,8 +11,8 @@
 # Requirements:
 #   - portavault script in the same directory as this file
 #   - gpg with loopback pinentry enabled
-#   - sudo (passwordless or interactive) for open/close/passwd on Linux;
-#     all mutating commands on OpenBSD/FreeBSD
+#   - doas on OpenBSD, sudo on Linux/FreeBSD (passwordless or interactive)
+#     for open/close/passwd and other mount operations
 #
 
 set -u
@@ -156,19 +156,36 @@ size=$size
 EOF
 }
 
-# Run portavault, using sudo when required.
-run_pv() {
-    if [ "$NEED_SUDO" = "1" ] && [ "$(id -u)" != "0" ]; then
-        sudo -E env \
-            PORTAVAULT_STATE="$PORTAVAULT_STATE" \
-            PORTAVAULT_CONFIG="$PORTAVAULT_CONFIG" \
-            "$PV" "$@"
+PRIV_CMD=
+NEED_PRIV=0
+
+# Run a command with test env; elevate via doas (OpenBSD) or sudo when needed.
+priv_run() {
+    if [ "$NEED_PRIV" = "1" ] && [ "$(id -u)" != "0" ] && [ -n "$PRIV_CMD" ]; then
+        case "$PRIV_CMD" in
+            sudo)
+                sudo -E env \
+                    PORTAVAULT_STATE="$PORTAVAULT_STATE" \
+                    PORTAVAULT_CONFIG="$PORTAVAULT_CONFIG" \
+                    "$@"
+                ;;
+            doas)
+                doas env \
+                    PORTAVAULT_STATE="$PORTAVAULT_STATE" \
+                    PORTAVAULT_CONFIG="$PORTAVAULT_CONFIG" \
+                    "$@"
+                ;;
+        esac
     else
         env \
             PORTAVAULT_STATE="$PORTAVAULT_STATE" \
             PORTAVAULT_CONFIG="$PORTAVAULT_CONFIG" \
-            "$PV" "$@"
+            "$@"
     fi
+}
+
+run_pv() {
+    priv_run "$PV" "$@"
 }
 
 run_pv_user() {
@@ -179,16 +196,15 @@ run_pv_user() {
 }
 
 pipe_pv() {
-    if [ "$NEED_SUDO" = "1" ] && [ "$(id -u)" != "0" ]; then
-        sudo -E env \
-            PORTAVAULT_STATE="$PORTAVAULT_STATE" \
-            PORTAVAULT_CONFIG="$PORTAVAULT_CONFIG" \
-            "$PV" "$@"
+    priv_run "$PV" "$@"
+}
+
+priv_tee() {
+    target=$1
+    if [ "$NEED_PRIV" = "1" ] && [ "$(id -u)" != "0" ] && [ -n "$PRIV_CMD" ]; then
+        $PRIV_CMD tee "$target"
     else
-        env \
-            PORTAVAULT_STATE="$PORTAVAULT_STATE" \
-            PORTAVAULT_CONFIG="$PORTAVAULT_CONFIG" \
-            "$PV" "$@"
+        tee "$target"
     fi
 }
 
@@ -201,17 +217,45 @@ detect_os() {
     esac
 }
 
-setup_sudo() {
-    NEED_SUDO=0
+setup_priv() {
+    NEED_PRIV=0
+    PRIV_CMD=
     case "$OS" in
-        openbsd|freebsd) NEED_SUDO=1 ;;
-        linux) NEED_SUDO=1 ;;
+        openbsd|freebsd|linux) NEED_PRIV=1 ;;
     esac
-    if [ "$NEED_SUDO" = "1" ] && [ "$(id -u)" != "0" ]; then
-        if ! sudo -n true 2>/dev/null; then
-            log "sudo required; you may be prompted for a password"
-            sudo true
-        fi
+    if [ "$NEED_PRIV" = "1" ] && [ "$(id -u)" != "0" ]; then
+        case "$OS" in
+            openbsd)
+                if command -v doas >/dev/null 2>&1; then
+                    PRIV_CMD=doas
+                else
+                    log "doas not found (required on OpenBSD)"
+                    exit 1
+                fi
+                ;;
+            *)
+                if command -v sudo >/dev/null 2>&1; then
+                    PRIV_CMD=sudo
+                else
+                    log "sudo not found"
+                    exit 1
+                fi
+                ;;
+        esac
+        case "$PRIV_CMD" in
+            doas)
+                if ! doas -n true 2>/dev/null; then
+                    log "doas required; you may be prompted for a password"
+                    doas true || exit 1
+                fi
+                ;;
+            sudo)
+                if ! sudo -n true 2>/dev/null; then
+                    log "sudo required; you may be prompted for a password"
+                    sudo true || exit 1
+                fi
+                ;;
+        esac
     fi
 }
 
@@ -261,7 +305,7 @@ test_prerequisites() {
 
 test_help() {
     log "help"
-    out=$(assert_success "help exits 0" "$PV" help)
+    out=$(assert_success "help exits 0" run_pv_user help)
     assert_contains "help mentions create" "$out" "create"
     assert_contains "help mentions open" "$out" "open"
     assert_contains "help mentions read-only URL" "$out" "read-only"
@@ -323,7 +367,7 @@ test_write_and_ownership() {
     if printf 'integration test\n' > "$TD/mnt-plain/testfile.txt" 2>/dev/null; then
         :
     else
-        printf 'integration test\n' | sudo tee "$TD/mnt-plain/testfile.txt" >/dev/null
+        printf 'integration test\n' | priv_tee "$TD/mnt-plain/testfile.txt" >/dev/null
     fi
     if [ -f "$TD/mnt-plain/testfile.txt" ]; then
         pass "wrote testfile.txt"
@@ -364,11 +408,19 @@ test_double_open_fails() {
         sh -c "printf '%s\n' '$PASS' | $(pv_pipe_cmd) open"
 }
 
-# Emit a shell snippet for piping into portavault under sudo when needed.
+# Emit a shell snippet for piping into portavault under doas/sudo when needed.
 pv_pipe_cmd() {
-    if [ "$NEED_SUDO" = "1" ] && [ "$(id -u)" != "0" ]; then
-        printf "sudo -E env PORTAVAULT_STATE=%s PORTAVAULT_CONFIG=%s %s" \
-            "$PORTAVAULT_STATE" "$PORTAVAULT_CONFIG" "$PV"
+    if [ "$NEED_PRIV" = "1" ] && [ "$(id -u)" != "0" ] && [ -n "$PRIV_CMD" ]; then
+        case "$PRIV_CMD" in
+            sudo)
+                printf "sudo -E env PORTAVAULT_STATE=%s PORTAVAULT_CONFIG=%s %s" \
+                    "$PORTAVAULT_STATE" "$PORTAVAULT_CONFIG" "$PV"
+                ;;
+            doas)
+                printf "doas env PORTAVAULT_STATE=%s PORTAVAULT_CONFIG=%s %s" \
+                    "$PORTAVAULT_STATE" "$PORTAVAULT_CONFIG" "$PV"
+                ;;
+        esac
     else
         printf "env PORTAVAULT_STATE=%s PORTAVAULT_CONFIG=%s %s" \
             "$PORTAVAULT_STATE" "$PORTAVAULT_CONFIG" "$PV"
@@ -412,7 +464,7 @@ test_compressed_roundtrip() {
     if printf 'compressed\n' > "$TD/mnt-comp/blob.txt" 2>/dev/null; then
         :
     else
-        printf 'compressed\n' | sudo tee "$TD/mnt-comp/blob.txt" >/dev/null
+        printf 'compressed\n' | priv_tee "$TD/mnt-comp/blob.txt" >/dev/null
     fi
     printf '%s\n' "$PASS" | pipe_pv close >/dev/null
     printf '%s\n' "$PASS" | pipe_pv open -m "$TD/mnt-comp" 2>&1 \
@@ -509,7 +561,7 @@ test_open_already_active_message() {
 
 main() {
     detect_os
-    setup_sudo
+    setup_priv
     log "portavault test suite (OS=$OS, dir=$TD)"
     log "portavault=$PV"
 

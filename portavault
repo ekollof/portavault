@@ -86,9 +86,28 @@ detect_os() {
     esac
 }
 
-# ---- Linux sudo: correct HOME and mount ownership ------------------------
+# ---- Invoking user (sudo / doas): HOME, ownership, gpg ------------------
 
-sudo_user_home() {
+invoking_user() {
+    if [ -n "${SUDO_USER:-}" ]; then
+        printf '%s' "$SUDO_USER"
+    elif [ -n "${DOAS_USER:-}" ]; then
+        printf '%s' "$DOAS_USER"
+    fi
+}
+
+invoking_uid() {
+    if [ -n "${SUDO_UID:-}" ]; then
+        printf '%s' "$SUDO_UID"
+        return
+    fi
+    user=$(invoking_user)
+    if [ -n "$user" ]; then
+        id -u "$user" 2>/dev/null
+    fi
+}
+
+passwd_home() {
     user=$1
     home=$(getent passwd "$user" 2>/dev/null | cut -d: -f6)
     if [ -z "$home" ]; then
@@ -101,10 +120,11 @@ sudo_user_home() {
 }
 
 resolve_home() {
-    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
-        sudo_home=$(sudo_user_home "$SUDO_USER")
-        if [ -n "$sudo_home" ]; then
-            HOME=$sudo_home
+    user=$(invoking_user)
+    if [ "$(id -u)" = "0" ] && [ -n "$user" ]; then
+        user_home=$(passwd_home "$user")
+        if [ -n "$user_home" ]; then
+            HOME=$user_home
         fi
     fi
     DEFAULT_MOUNTPOINT="${DEFAULT_MOUNTPOINT:-$HOME/vault}"
@@ -116,33 +136,39 @@ init_paths() {
 }
 
 effective_uid() {
-    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_UID:-}" ]; then
-        printf '%s' "$SUDO_UID"
+    uid=$(invoking_uid)
+    if [ "$(id -u)" = "0" ] && [ -n "$uid" ]; then
+        printf '%s' "$uid"
     else
         id -u
     fi
 }
 
 effective_gid() {
-    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_UID:-}" ]; then
+    if [ "$(id -u)" = "0" ]; then
         if [ -n "${SUDO_GID:-}" ]; then
             printf '%s' "$SUDO_GID"
-        elif [ -n "${SUDO_USER:-}" ]; then
-            id -g "$SUDO_USER" 2>/dev/null || id -g
-        else
-            id -g
+            return
         fi
-    else
-        id -g
+        user=$(invoking_user)
+        if [ -n "$user" ]; then
+            gid=$(id -g "$user" 2>/dev/null) || gid=
+            if [ -n "$gid" ]; then
+                printf '%s' "$gid"
+                return
+            fi
+        fi
     fi
+    id -g
 }
 
-# When invoked via sudo, root-owned paths block the invoking user and run_gpg.
+# When invoked via sudo/doas, root-owned paths block the invoking user and run_gpg.
 chown_if_sudo() {
     path=$1
-    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_UID:-}" ]; then
-        chown "$SUDO_UID:$(effective_gid)" "$path" 2>/dev/null \
-            || chown "$SUDO_UID" "$path" 2>/dev/null \
+    uid=$(invoking_uid)
+    if [ "$(id -u)" = "0" ] && [ -n "$uid" ]; then
+        chown "$uid:$(effective_gid)" "$path" 2>/dev/null \
+            || chown "$uid" "$path" 2>/dev/null \
             || true
     fi
 }
@@ -152,10 +178,15 @@ prepare_private_dir() {
     chown_if_sudo "$1"
 }
 
-# Run gpg as the invoking user when sudo'd, so GNUPGHOME ownership matches.
+# Run gpg as the invoking user when elevated, so GNUPGHOME ownership matches.
 run_gpg() {
-    if [ "$(id -u)" = "0" ] && [ -n "${SUDO_USER:-}" ]; then
-        sudo -u "$SUDO_USER" gpg "$@"
+    user=$(invoking_user)
+    if [ "$(id -u)" = "0" ] && [ -n "$user" ]; then
+        if [ -n "${SUDO_USER:-}" ] && command -v sudo >/dev/null 2>&1; then
+            sudo -u "$SUDO_USER" gpg "$@"
+        else
+            su -m "$user" -c 'exec "$@"' sh gpg "$@"
+        fi
     else
         gpg "$@"
     fi
@@ -312,7 +343,7 @@ check_deps() {
     done
     case "$OS" in
         openbsd)
-            for cmd in vnconfig newfs_msdos mount_tmpfs; do
+            for cmd in vnconfig newfs_msdos mount_msdos mount_tmpfs; do
                 command -v "$cmd" >/dev/null 2>&1 \
                     || die "missing required command: $cmd"
             done
