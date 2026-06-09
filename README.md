@@ -4,7 +4,7 @@ Portable encrypted vault for **OpenBSD**, **FreeBSD**, and **Linux**.
 
 **Design goal: as few dependencies as possible.** `portavault` is a single POSIX `sh` script with **no build step, no language runtime, and no third-party packages** beyond what a normal Unix base system already provides. The only dependency you must install separately is **GnuPG** (`gpg`). Everything else is a standard OS utility (`mount`, `gzip`, `mktemp`, loop/format tools, and the like).
 
-It creates a FAT32 disk image, optionally compresses it with gzip, encrypts it with GPG (AES-256), and on demand decrypts into a private tmpfs, mounts via the OS-native loopback device, and tears everything down on close. Plaintext exists only in memory-backed tmpfs while the vault is open.
+It creates a FAT32 disk image, optionally compresses it with gzip, encrypts it with GPG (AES-256), and on demand decrypts into a private RAM-backed work directory (tmpfs on Linux/FreeBSD, `mfs` on OpenBSD), mounts via the OS-native loopback device, and tears everything down on close. Plaintext exists only in that memory-backed area while the vault is open.
 
 ## Dependencies
 
@@ -20,17 +20,29 @@ These ship with OpenBSD, FreeBSD, or a typical Linux distribution — not separa
 
 | Tool | Purpose |
 |------|---------|
-| `/bin/sh`, `mount`, `umount`, `mktemp`, `truncate`, `od` | Script runtime and mounts |
+| `/bin/sh`, `mount`, `umount`, `mktemp`, `od`, `dd` | Script runtime and mounts |
 | `gzip` / `gunzip` | Compression (optional at create time) |
 | `file` | FAT payload detection (gzip also detected via `od`) |
-| **Linux:** `mkfs.fat` | FAT32 image creation |
+| **Linux:** `mkfs.fat`, `truncate` | FAT32 image creation |
 | **Linux:** `curl` or `wget` | URL fetch only (if you open remote vaults) |
-| **OpenBSD:** `vnconfig`, `newfs_msdos`, `mount_tmpfs`, `ftp` | Loop, format, tmpfs, fetch |
-| **FreeBSD:** `mdconfig`, `newfs_msdos`, `fetch` | Loop, format, fetch |
+| **OpenBSD:** `vnconfig`, `newfs_msdos`, `mount_msdos`, `mount_mfs`, `ftp` | Loop, format, mount, RAM work dir, fetch |
+| **FreeBSD:** `mdconfig`, `newfs_msdos`, `mount_msdosfs`, `fetch` | Loop, format, mount, fetch |
 
 **Not used:** Python, Ruby, Node, Docker, `openssl enc`, FUSE modules, or any extra crypto stack beyond GPG.
 
-**Privileges:** `open`, `close`, and `passwd` require root (tmpfs + mount). On Linux, `create` runs as a normal user; on BSD it needs root for vnode formatting.
+### Privilege elevation (install yourself on BSD)
+
+`open`, `close`, and `passwd` need root (mount + RAM-backed work directory). Run them via a small elevation helper:
+
+| OS | Typical tool | Notes |
+|----|--------------|-------|
+| **Linux** | `sudo` | Usually in base; `create` does not need root |
+| **OpenBSD** | `doas` | In base; configure `/etc/doas.conf` |
+| **FreeBSD** | `sudo` or `doas` | **Not in a minimal base install** — install from ports, e.g. `pkg install sudo` |
+
+`portavault` recognizes `SUDO_USER` / `SUDO_UID` (Linux and FreeBSD `sudo`) and `DOAS_USER` (OpenBSD and FreeBSD `doas`) so mounts and files stay owned by you.
+
+On BSD, `create` also needs root for vnode formatting.
 
 ## Install
 
@@ -46,14 +58,15 @@ install -m 644 portavault.conf.example ~/.config/portavault.conf
 # Create a 1 GiB encrypted vault (Linux: no sudo needed)
 portavault create ~/vault.img.gpg -s 1G
 
-# Open (sudo required)
-sudo portavault open ~/vault.img.gpg -m ~/vault
+# Open (root via sudo on Linux/FreeBSD, or doas on OpenBSD)
+sudo portavault open ~/vault.img.gpg -m ~/vault   # Linux, FreeBSD
+# doas portavault open ~/vault.img.gpg -m ~/vault  # OpenBSD
 
 # Use the mount, then close and save
 echo "secret" > ~/vault/notes.txt
-sudo portavault close
+sudo portavault close   # or: doas portavault close
 
-# Check status (no sudo needed when vault is open)
+# Check status (no elevation needed while vault is open)
 portavault status
 ```
 
@@ -83,7 +96,7 @@ Decrypts the vault into tmpfs and mounts the FAT32 image.
 
 - Vault source: local path or URL (`http://`, `https://`, `ftp://`)
 - **URL vaults are read-only** — changes are not saved on `close`
-- On Linux under `sudo`, files are owned by the invoking user (`SUDO_UID`)
+- Under `sudo` or `doas`, files are owned by the invoking user (`SUDO_UID` / `DOAS_USER`)
 
 ### `close`
 
@@ -127,17 +140,17 @@ FAT32 has no Unix permissions; restrict access via mountpoint permissions (`chmo
 ./run-tests.sh                # run tests under sh, dash, oksh, ksh
 ```
 
-Requires passwordless or interactive `sudo` on Linux for mount tests.
+Tests use `sudo` on Linux and FreeBSD, `doas` on OpenBSD (passwordless or interactive).
 
 ## Platform notes
 
-| OS | Loop device | FAT mount |
-|----|-------------|-----------|
-| OpenBSD | `vnconfig` (auto `vnd0`–`vnd7`) | `mount -t msdos -u -g -m 077` |
-| FreeBSD | `mdconfig` (auto unit) | `mount -t msdosfs -u -g -m 077` |
-| Linux | `mount -o loop` | `mount -t vfat` |
+| OS | RAM work dir | Loop device | FAT mount |
+|----|--------------|-------------|-----------|
+| OpenBSD | `mount_mfs` | `vnconfig` (`vnd0`–`vnd7`) | `mount_msdos -m 700` |
+| FreeBSD | `tmpfs` | `mdconfig` (auto unit) | `mount_msdosfs -m 700` |
+| Linux | `tmpfs` | `mount -o loop` | `mount -t vfat` |
 
-OpenBSD tmpfs size is derived from the encrypted file size (clamped by `size` and `tmpfs_size` config keys).
+OpenBSD has no working `tmpfs` in the default kernel; `mount_mfs` size is derived from the vault (`size` config) and capped by `tmpfs_size`.
 
 On **FreeBSD and OpenBSD**, images smaller than 256 MiB are formatted as **FAT16** (BSD `newfs_msdos` cannot fit FAT32 below that). Linux uses FAT32 at any supported size.
 
