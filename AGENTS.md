@@ -4,7 +4,9 @@ This document helps automated agents work safely and effectively on **portavault
 
 ## Project overview
 
-**portavault** is a portable encrypted vault tool implemented as one POSIX `sh` script plus supporting files:
+**Primary design goal: as few dependencies as possible, besides GnuPG.**
+
+**portavault** is a portable encrypted vault tool implemented as one POSIX `sh` script plus supporting files. Users install `gpg`; everything else must already exist on a normal OpenBSD, FreeBSD, or Linux system (`mount`, `gzip`, `mktemp`, OS loop/format tools). Do not add Python, Node, Ruby, FUSE, extra crypto CLIs, or packaged language runtimes.
 
 | File | Role |
 |------|------|
@@ -17,11 +19,12 @@ There is no build step, package manager, or library code. Changes are made direc
 
 ## Hard constraints (do not violate)
 
-1. **POSIX `/bin/sh` only** — no bashisms (`[[ ]]`, arrays, `function` keyword, `source`, etc.). Must run on OpenBSD `/bin/sh`, FreeBSD `/bin/sh`, Linux `dash`, and `oksh`.
-2. **No new external dependencies** — use only OS-provided tools already relied upon (`gpg`, `gzip`, `mount`, OS-specific loop/format utils). On Linux, `curl` is allowed for URL fetch (`wget` as fallback).
-3. **Do not source config or state** — both are parsed as `key=value` lines via `load_config()` / `read_state()`. Never use `. file` on user-controlled paths.
-4. **Preserve OS branches** — platform logic uses `case "$OS" in openbsd|freebsd|linux)`. Test all three mentally when editing shared paths.
-5. **Minimal diffs** — this is a small tool; avoid drive-by refactors, new markdown files, or scope creep unless asked.
+1. **Minimal dependencies** — `gpg` is the only deliberate install. All other commands must be standard base-system utilities on each supported OS. Never introduce a new third-party package, language runtime, or optional module. Before adding any command, ask: “is this already on a default Unix install?”
+2. **POSIX `/bin/sh` only** — no bashisms (`[[ ]]`, arrays, `function` keyword, `source`, etc.). Must run on OpenBSD `/bin/sh`, FreeBSD `/bin/sh`, Linux `dash`, and `oksh`.
+3. **No new external dependencies** — if a feature needs something beyond gpg + OS builtins, defer it or implement with existing tools only. On Linux, `curl` is allowed for URL fetch (`wget` as existing fallback).
+4. **Do not source config or state** — both are parsed as `key=value` lines via `load_config()` / `read_state()`. Never use `. file` on user-controlled paths.
+5. **Preserve OS branches** — platform logic uses `case "$OS" in openbsd|freebsd|linux)`. Test all three mentally when editing shared paths.
+6. **Minimal diffs** — this is a small tool; avoid drive-by refactors, new markdown files, or scope creep unless asked.
 
 ## Architecture (mental model)
 
@@ -106,6 +109,7 @@ Edit `GPG_CIPHER_OPTS` / `GPG_DIGEST_OPTS` near the top of `portavault`. Ensure 
 
 ## Out of scope (unless user explicitly asks)
 
+- Anything that adds dependencies beyond gpg + OS builtins (SFTP clients, FUSE, `openssl enc`, language runtimes, etc.)
 - SFTP/SCP upload, macOS/NetBSD support, non-interactive GPG agent flow
 - Multi-vault concurrency (single global state file by design)
 - Rewriting in another language or adding a dependency manager

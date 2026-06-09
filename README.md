@@ -2,21 +2,33 @@
 
 Portable encrypted vault for **OpenBSD**, **FreeBSD**, and **Linux**.
 
-`portavault` is a single POSIX `sh` script that creates a FAT32 disk image, optionally compresses it with gzip, encrypts it with GPG (AES-256), and on demand decrypts into a private tmpfs, mounts via the OS-native loopback device, and tears everything down on close.
+**Design goal: as few dependencies as possible.** `portavault` is a single POSIX `sh` script with **no build step, no language runtime, and no third-party packages** beyond what a normal Unix base system already provides. The only dependency you must install separately is **GnuPG** (`gpg`). Everything else is a standard OS utility (`mount`, `gzip`, `mktemp`, loop/format tools, and the like).
 
-Plaintext exists only in memory-backed tmpfs while the vault is open.
+It creates a FAT32 disk image, optionally compresses it with gzip, encrypts it with GPG (AES-256), and on demand decrypts into a private tmpfs, mounts via the OS-native loopback device, and tears everything down on close. Plaintext exists only in memory-backed tmpfs while the vault is open.
 
-## Requirements
+## Dependencies
+
+### Required (install yourself)
 
 | Tool | Purpose |
 |------|---------|
 | `gpg` | Symmetric encrypt/decrypt (loopback pinentry required) |
-| `gzip` / `gunzip` | Optional compression |
-| `truncate`, `mktemp`, `file`, `od` | Image sizing and type detection |
-| `mount`, `umount` | tmpfs and FAT mounts |
-| **Linux:** `mkfs.fat`, `curl` or `wget` (URL fetch) | Format and download |
-| **OpenBSD:** `vnconfig`, `newfs_msdos`, `mount_tmpfs`, `ftp` | Loop device and fetch |
-| **FreeBSD:** `mdconfig`, `newfs_msdos`, `fetch` | Loop device and fetch |
+
+### Base system (already on a normal Unix install)
+
+These ship with OpenBSD, FreeBSD, or a typical Linux distribution — not separate packages to add for portavault:
+
+| Tool | Purpose |
+|------|---------|
+| `/bin/sh`, `mount`, `umount`, `mktemp`, `truncate`, `od` | Script runtime and mounts |
+| `gzip` / `gunzip` | Compression (optional at create time) |
+| `file` | FAT payload detection (gzip also detected via `od`) |
+| **Linux:** `mkfs.fat` | FAT32 image creation |
+| **Linux:** `curl` or `wget` | URL fetch only (if you open remote vaults) |
+| **OpenBSD:** `vnconfig`, `newfs_msdos`, `mount_tmpfs`, `ftp` | Loop, format, tmpfs, fetch |
+| **FreeBSD:** `mdconfig`, `newfs_msdos`, `fetch` | Loop, format, fetch |
+
+**Not used:** Python, Ruby, Node, Docker, `openssl enc`, FUSE modules, or any extra crypto stack beyond GPG.
 
 **Privileges:** `open`, `close`, and `passwd` require root (tmpfs + mount). On Linux, `create` runs as a normal user; on BSD it needs root for vnode formatting.
 

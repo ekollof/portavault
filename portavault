@@ -5,6 +5,10 @@
 #
 # portavault - portable encrypted vault for OpenBSD, FreeBSD, and Linux
 #
+# Design: minimal dependencies. One POSIX sh script; gpg is the only thing
+# you install yourself. All other tools are standard OS utilities (mount,
+# gzip, mktemp, loop/format helpers). No build step, no extra runtimes.
+#
 # Creates a FAT32 image file, gzips it, encrypts with gpg, and on demand
 # decrypts to a private tmpfs, mounts via the OS-native loopback mechanism,
 # and tears it all down on close.
@@ -922,6 +926,7 @@ cmd_passwd() {
 usage() {
     cat <<EOF
 $PROGNAME v$VERSION - portable encrypted vault (OpenBSD/FreeBSD/Linux)
+Minimal dependencies: POSIX sh + gpg + standard OS tools. No build step.
 
 Usage:
   $PROGNAME create   <vault> [-s size] [--no-compress]
