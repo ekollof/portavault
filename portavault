@@ -246,9 +246,14 @@ alloc_image() {
 compute_tmpfs_bytes() {
     enc_file=$1
     enc_bytes=$(wc -c < "$enc_file" | tr -d ' ')
-    min_bytes=$(parse_size_bytes "$DEFAULT_SIZE")
     cap_bytes=$(parse_size_bytes "$TMPFS_SIZE_CAP")
+    # Headroom for decrypt, decompression, and re-encrypt temps (~4x ciphertext).
     tmpfs_bytes=$(( enc_bytes * 4 ))
+    # Do not floor to DEFAULT_SIZE (vault image size): OpenBSD mfs reserves RAM.
+    min_bytes=$(( enc_bytes * 2 ))
+    if [ "$min_bytes" -lt 33554432 ]; then
+        min_bytes=33554432
+    fi
     if [ "$tmpfs_bytes" -lt "$min_bytes" ]; then
         tmpfs_bytes=$min_bytes
     fi
