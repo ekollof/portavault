@@ -263,6 +263,26 @@ compute_tmpfs_bytes() {
     printf '%s' "$tmpfs_bytes"
 }
 
+# mount_mfs/newfs -s without a scale suffix is sectors (512 bytes), not bytes.
+format_mfs_size() {
+    bytes=$1
+    if [ "$bytes" -ge 1073741824 ] && [ $(( bytes % 1073741824 )) -eq 0 ]; then
+        printf '%sG' $(( bytes / 1073741824 ))
+        return
+    fi
+    if [ "$bytes" -ge 1048576 ]; then
+        mb=$(( (bytes + 1048576 - 1) / 1048576 ))
+        printf '%sM' "$mb"
+        return
+    fi
+    if [ "$bytes" -ge 1024 ]; then
+        kb=$(( (bytes + 1024 - 1) / 1024 ))
+        printf '%sK' "$kb"
+        return
+    fi
+    printf '%sB' "$bytes"
+}
+
 # ---- Config loading (key=value, no shell execution) ----------------------
 
 check_config_perms() {
@@ -496,7 +516,8 @@ mount_private_tmpfs() {
             if [ -z "$size_bytes" ]; then
                 size_bytes=$(parse_size_bytes "$DEFAULT_SIZE")
             fi
-            mount_mfs -o nodev,nosuid -s "$size_bytes" swap "$dir"
+            mfs_size=$(format_mfs_size "$size_bytes")
+            mount_mfs -o nodev,nosuid -s "$mfs_size" swap "$dir"
             ;;
         freebsd)  mount -t tmpfs tmpfs "$dir" ;;
         linux)    mount -t tmpfs tmpfs "$dir" ;;
